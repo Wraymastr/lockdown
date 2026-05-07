@@ -1,0 +1,904 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Exam Lockdown Tool — A toggleable internet restriction utility for Windows education devices.
+
+.DESCRIPTION
+    This script provides a Windows Forms GUI to activate or deactivate an internet lockdown.
+    When locked:
+      - All HTTP/HTTPS traffic is routed through a black-hole proxy (127.0.0.1:9999)
+      - One or more whitelisted domains (and their subdomains) bypass the proxy
+      - Users are prevented from changing proxy settings manually
+      - A Dead Man's Switch scheduled task auto-restores after N hours
+    When unlocked:
+      - All original proxy settings are restored from a backup
+      - The scheduled task is removed
+      - The flag and backup file are deleted
+
+.NOTES
+    Must be run as Administrator.
+    Tested on Windows 10/11.
+
+    CONFIGURATION — Edit the variables in the "CONFIG" region below.
+#>
+
+# ============================================================
+# REGION: CONFIGURATION
+# Edit these values before deploying.
+# ============================================================
+$CONFIG = @{
+    # Domains to whitelist (and all their subdomains). Comma-separated.
+    # Example: "school.edu, exam.org" also covers *.school.edu and *.exam.org
+    WhitelistDomain     = "INSERT_DOMAIN_HERE"
+
+    # Black-hole proxy address. Nothing should be listening here.
+    BlackHoleProxy      = "127.0.0.1:9999"
+
+    # Hours before the Dead Man's Switch auto-restores the system.
+    DeadManHours        = 4
+
+    # Where to store the flag and backup files.
+    DataDir             = "$env:ProgramData\ExamLockdown"
+
+    # Registry flag key path (HKLM — requires admin).
+    FlagRegPath         = "HKLM:\SOFTWARE\ExamLockdown"
+    FlagRegName         = "LockdownActive"
+
+    # Scheduled task name for the Dead Man's Switch.
+    TaskName            = "ExamLockdown_DeadMansSwitch"
+
+    # Path to this script (used when registering the scheduled task).
+    # Leave as $PSCommandPath to auto-detect.
+    ScriptPath          = $PSCommandPath
+}
+
+# ============================================================
+# REGION: ADMIN PRIVILEGE CHECK
+# ============================================================
+function Test-Administrator {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]$identity
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Test-Administrator)) {
+    # Re-launch with elevation if not already admin.
+    $args = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process powershell.exe -ArgumentList $args -Verb RunAs
+    exit
+}
+
+# ============================================================
+# REGION: LOGGING UTILITY
+# ============================================================
+$LogFile = Join-Path $CONFIG.DataDir "lockdown.log"
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp][$Level] $Message"
+    try {
+        if (-not (Test-Path $CONFIG.DataDir)) { New-Item -Path $CONFIG.DataDir -ItemType Directory -Force | Out-Null }
+        Add-Content -Path $LogFile -Value $line -Encoding UTF8
+    } catch { <# Swallow log errors silently #> }
+    Write-Host $line
+}
+
+# ============================================================
+# REGION: REGISTRY PROXY HELPERS
+# ============================================================
+$ProxyRegPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+$IEPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Control Panel"
+
+function Get-ProxySettings {
+    <# Returns a hashtable of current HKCU proxy registry values. #>
+    $settings = @{}
+    $keys = @("ProxyEnable","ProxyServer","ProxyOverride","AutoConfigURL")
+    foreach ($key in $keys) {
+        try {
+            $val = Get-ItemProperty -Path $ProxyRegPath -Name $key -ErrorAction SilentlyContinue
+            $settings[$key] = if ($val) { $val.$key } else { $null }
+        } catch { $settings[$key] = $null }
+    }
+    return $settings
+}
+
+function Set-ProxySettings {
+    param(
+        [int]    $Enable,
+        [string] $Server,
+        [string] $Override
+    )
+    try {
+        Set-ItemProperty -Path $ProxyRegPath -Name "ProxyEnable"   -Value $Enable   -Type DWord   -Force
+        Set-ItemProperty -Path $ProxyRegPath -Name "ProxyServer"   -Value $Server   -Type String  -Force
+        Set-ItemProperty -Path $ProxyRegPath -Name "ProxyOverride" -Value $Override -Type String  -Force
+        # Notify WinINet of the change so browsers pick it up immediately.
+        $signature = @"
+[DllImport("wininet.dll", SetLastError = true, CharSet = CharSet.Auto)]
+public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+"@
+        $wininet = Add-Type -MemberDefinition $signature -Name "WinINet" -Namespace "PInvoke" -PassThru -ErrorAction SilentlyContinue
+        if ($wininet) {
+            $wininet::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null  # INTERNET_OPTION_SETTINGS_CHANGED
+            $wininet::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null  # INTERNET_OPTION_REFRESH
+        }
+    } catch {
+        Write-Log "Set-ProxySettings error: $_" "ERROR"
+    }
+}
+
+function Lock-ProxyUI {
+    <# Prevents users from editing proxy settings in Windows Settings / IE. #>
+    try {
+        if (-not (Test-Path $IEPolicyPath)) { New-Item -Path $IEPolicyPath -Force | Out-Null }
+        Set-ItemProperty -Path $IEPolicyPath -Name "Proxy" -Value 1 -Type DWord -Force
+        Write-Log "Proxy UI locked via Group Policy registry key."
+    } catch {
+        Write-Log "Lock-ProxyUI error: $_" "WARN"
+    }
+}
+
+function Unlock-ProxyUI {
+    <# Removes the proxy-UI restriction. #>
+    try {
+        if (Test-Path $IEPolicyPath) {
+            Remove-ItemProperty -Path $IEPolicyPath -Name "Proxy" -ErrorAction SilentlyContinue
+        }
+        Write-Log "Proxy UI restriction removed."
+    } catch {
+        Write-Log "Unlock-ProxyUI error: $_" "WARN"
+    }
+}
+
+# ============================================================
+# REGION: FLAG MANAGEMENT
+# ============================================================
+function Test-LockdownFlag {
+    try {
+        $val = Get-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.FlagRegName -ErrorAction SilentlyContinue
+        return ($null -ne $val -and $val.($CONFIG.FlagRegName) -eq 1)
+    } catch { return $false }
+}
+
+function Set-LockdownFlag {
+    try {
+        if (-not (Test-Path $CONFIG.FlagRegPath)) { New-Item -Path $CONFIG.FlagRegPath -Force | Out-Null }
+        Set-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.FlagRegName -Value 1 -Type DWord -Force
+        Write-Log "Lockdown flag set."
+    } catch { Write-Log "Set-LockdownFlag error: $_" "ERROR" }
+}
+
+function Remove-LockdownFlag {
+    try {
+        if (Test-Path $CONFIG.FlagRegPath) {
+            Remove-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.FlagRegName -ErrorAction SilentlyContinue
+        }
+        Write-Log "Lockdown flag removed."
+    } catch { Write-Log "Remove-LockdownFlag error: $_" "WARN" }
+}
+
+# ============================================================
+# REGION: BACKUP / RESTORE
+# ============================================================
+$BackupFile = Join-Path $CONFIG.DataDir "proxy_backup.json"
+
+function Save-ProxyBackup {
+    try {
+        if (-not (Test-Path $CONFIG.DataDir)) { New-Item -Path $CONFIG.DataDir -ItemType Directory -Force | Out-Null }
+        $current = Get-ProxySettings
+        $current | ConvertTo-Json -Depth 3 | Set-Content -Path $BackupFile -Encoding UTF8 -Force
+        Write-Log "Proxy backup saved to $BackupFile."
+    } catch {
+        Write-Log "Save-ProxyBackup error: $_" "ERROR"
+        throw
+    }
+}
+
+function Restore-ProxyBackup {
+    try {
+        if (-not (Test-Path $BackupFile)) {
+            Write-Log "Backup file not found — applying safe defaults." "WARN"
+            Set-ProxySettings -Enable 0 -Server "" -Override "<local>"
+            return
+        }
+        $backup = Get-Content -Path $BackupFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $bEnable   = if ($null -ne $backup.ProxyEnable)   { [int][string]$backup.ProxyEnable }       else { 0 }
+        $bServer   = if ($null -ne $backup.ProxyServer)   { [string]$backup.ProxyServer }            else { "" }
+        $bOverride = if ($null -ne $backup.ProxyOverride) { [string]$backup.ProxyOverride }          else { "<local>" }
+        Set-ProxySettings -Enable $bEnable -Server $bServer -Override $bOverride
+
+        # Restore AutoConfigURL separately if it existed.
+        if ($backup.AutoConfigURL) {
+            Set-ItemProperty -Path $ProxyRegPath -Name "AutoConfigURL" -Value $backup.AutoConfigURL -Type String -Force
+        } else {
+            Remove-ItemProperty -Path $ProxyRegPath -Name "AutoConfigURL" -ErrorAction SilentlyContinue
+        }
+        Write-Log "Proxy settings restored from backup."
+    } catch {
+        Write-Log "Restore-ProxyBackup error: $_" "ERROR"
+        # Fall-safe: at minimum disable the proxy.
+        try { Set-ItemProperty -Path $ProxyRegPath -Name "ProxyEnable" -Value 0 -Type DWord -Force } catch {}
+    }
+}
+
+function Remove-BackupFile {
+    try {
+        if (Test-Path $BackupFile) { Remove-Item -Path $BackupFile -Force }
+        Write-Log "Backup file removed."
+    } catch { Write-Log "Remove-BackupFile error: $_" "WARN" }
+}
+
+# ============================================================
+# REGION: DNS FLUSH
+# ============================================================
+function Invoke-DNSFlush {
+    try {
+        & ipconfig /flushdns 2>&1 | Out-Null
+        Write-Log "DNS cache flushed."
+    } catch { Write-Log "DNS flush error: $_" "WARN" }
+}
+
+# ============================================================
+# REGION: DEAD MAN'S SWITCH (Scheduled Task)
+# ============================================================
+function Register-DeadMansSwitch {
+    param([int]$Hours = $CONFIG.DeadManHours)
+    try {
+        $triggerTime = (Get-Date).AddHours($Hours)
+        $scriptArg   = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($CONFIG.ScriptPath)`" -AutoRestore"
+
+        # Build trigger and action objects.
+        $trigger = New-ScheduledTaskTrigger -Once -At $triggerTime
+        $action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $scriptArg
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 1) -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+        Register-ScheduledTask `
+            -TaskName  $CONFIG.TaskName `
+            -Trigger   $trigger `
+            -Action    $action `
+            -Settings  $settings `
+            -Principal $principal `
+            -Force | Out-Null
+
+        Write-Log "Dead Man's Switch scheduled for $($triggerTime.ToString('HH:mm:ss')) ($Hours hours)."
+    } catch {
+        Write-Log "Register-DeadMansSwitch error: $_" "ERROR"
+    }
+}
+
+function Unregister-DeadMansSwitch {
+    try {
+        $task = Get-ScheduledTask -TaskName $CONFIG.TaskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Unregister-ScheduledTask -TaskName $CONFIG.TaskName -Confirm:$false
+            Write-Log "Dead Man's Switch task removed."
+        }
+    } catch { Write-Log "Unregister-DeadMansSwitch error: $_" "WARN" }
+}
+
+function Get-DeadMansSwitchTime {
+    <# Returns a string like "14:35" if the task exists, else $null. #>
+    try {
+        $task = Get-ScheduledTask -TaskName $CONFIG.TaskName -ErrorAction SilentlyContinue
+        if ($task) {
+            $info = $task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+            if ($info.NextRunTime) { return $info.NextRunTime.ToString("HH:mm") }
+        }
+    } catch {}
+    return $null
+}
+
+# ============================================================
+# REGION: CORE LOCKDOWN / RESTORE LOGIC
+# ============================================================
+function Invoke-Lockdown {
+    Write-Log "===== LOCKDOWN INITIATED ====="
+    try {
+        Save-ProxyBackup
+
+        # Build ProxyOverride from comma-separated domain list.
+        # Each domain gets both the bare domain and a wildcard subdomain entry.
+        $domains  = $CONFIG.WhitelistDomain -split '\s*,\s*' | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim().ToLower() }
+        $entries  = foreach ($d in $domains) { $d; "*.$d" }
+        $override = ($entries + '<local>') -join ';'
+
+        Set-ProxySettings -Enable 1 -Server $CONFIG.BlackHoleProxy -Override $override
+
+        Lock-ProxyUI
+        Invoke-DNSFlush
+        Set-LockdownFlag
+        Register-DeadMansSwitch -Hours $CONFIG.DeadManHours
+
+        Write-Log "Lockdown complete. Whitelist: $override"
+        return $true
+    } catch {
+        Write-Log "LOCKDOWN FAILED: $_" "ERROR"
+        # Attempt rollback.
+        try { Restore-ProxyBackup } catch {}
+        try { Unlock-ProxyUI      } catch {}
+        try { Remove-LockdownFlag } catch {}
+        return $false
+    }
+}
+
+function Invoke-Restore {
+    Write-Log "===== RESTORE INITIATED ====="
+    try {
+        Restore-ProxyBackup
+        Unlock-ProxyUI
+        Invoke-DNSFlush
+        Unregister-DeadMansSwitch
+        Remove-LockdownFlag
+        Remove-BackupFile
+        Write-Log "Restore complete."
+        return $true
+    } catch {
+        Write-Log "RESTORE FAILED: $_" "ERROR"
+        return $false
+    }
+}
+
+# ============================================================
+# REGION: AUTO-RESTORE SWITCH (called by scheduled task)
+# ============================================================
+if ($args -contains "-AutoRestore") {
+    Write-Log "Dead Man's Switch triggered — auto-restoring system."
+    Invoke-Restore | Out-Null
+    exit
+}
+
+# ============================================================
+# REGION: WINDOWS FORMS GUI
+# ============================================================
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# ---------------------------------------------------------------
+# Color palette
+# ---------------------------------------------------------------
+$clrBg          = [System.Drawing.Color]::FromArgb(15,  17,  23)
+$clrPanel       = [System.Drawing.Color]::FromArgb(24,  27,  35)
+$clrBorder      = [System.Drawing.Color]::FromArgb(45,  50,  65)
+$clrTextPrimary = [System.Drawing.Color]::FromArgb(220, 225, 235)
+$clrTextMuted   = [System.Drawing.Color]::FromArgb(110, 120, 140)
+$clrGreen       = [System.Drawing.Color]::FromArgb(50,  210, 130)
+$clrRed         = [System.Drawing.Color]::FromArgb(255,  75,  90)
+$clrAmber       = [System.Drawing.Color]::FromArgb(255, 185,  50)
+$clrAccentLock  = [System.Drawing.Color]::FromArgb(200,  45,  65)
+$clrAccentRest  = [System.Drawing.Color]::FromArgb(35,  160, 110)
+$clrAccentCfg   = [System.Drawing.Color]::FromArgb(40,   90, 160)
+
+# ---------------------------------------------------------------
+# GfxHelper for rounded rectangles
+# ---------------------------------------------------------------
+Add-Type @"
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+public static class GfxHelper {
+    public static GraphicsPath RoundedRect(Rectangle r, int radius) {
+        GraphicsPath path = new GraphicsPath();
+        int d = radius * 2;
+        path.AddArc(r.X, r.Y, d, d, 180, 90);
+        path.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+        path.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+        path.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------
+# Layout constants — change these to reflow the whole UI
+# ---------------------------------------------------------------
+$W       = 540   # form client width
+$MARGIN  = 20    # left/right margin
+$INNER   = $W - ($MARGIN * 2)   # 500px panel width
+$Y_TITLE = 0
+$H_TITLE = 72
+$Y_STATUS = $H_TITLE + 12
+$H_STATUS = 90
+$Y_CFG   = $Y_STATUS + $H_STATUS + 12
+$H_CFG   = 112
+$Y_DMS   = $Y_CFG + $H_CFG + 10
+$H_DMS   = 44
+$Y_BTN_CFG  = $Y_DMS + $H_DMS + 14
+$H_BTN_CFG  = 44
+$Y_BTN_ACT  = $Y_BTN_CFG + $H_BTN_CFG + 10
+$H_BTN_ACT  = 64
+$Y_LOG_LBL  = $Y_BTN_ACT + $H_BTN_ACT + 14
+$H_LOG      = 96
+$Y_LOG      = $Y_LOG_LBL + 18
+$FORM_H     = $Y_LOG + $H_LOG + 20 + 38   # +38 for title bar chrome
+
+# ---------------------------------------------------------------
+# FORM
+# ---------------------------------------------------------------
+$form = New-Object System.Windows.Forms.Form
+$form.Text            = "Exam Lockdown Tool"
+$form.ClientSize      = New-Object System.Drawing.Size($W, ($FORM_H - 38))
+$form.StartPosition   = "CenterScreen"
+$form.FormBorderStyle = "FixedSingle"
+$form.MaximizeBox     = $false
+$form.BackColor       = $clrBg
+$form.ForeColor       = $clrTextPrimary
+$form.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
+$form.Icon            = [System.Drawing.SystemIcons]::Shield
+
+# ---------------------------------------------------------------
+# TITLE BAR
+# ---------------------------------------------------------------
+$pnlTitle = New-Object System.Windows.Forms.Panel
+$pnlTitle.Size      = New-Object System.Drawing.Size($W, $H_TITLE)
+$pnlTitle.Location  = New-Object System.Drawing.Point(0, $Y_TITLE)
+$pnlTitle.BackColor = $clrPanel
+$form.Controls.Add($pnlTitle)
+
+$lblAppName = New-Object System.Windows.Forms.Label
+$lblAppName.Text      = "EXAM LOCKDOWN"
+$lblAppName.Font      = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+$lblAppName.ForeColor = $clrTextPrimary
+$lblAppName.AutoSize  = $true
+$lblAppName.Location  = New-Object System.Drawing.Point($MARGIN, 12)
+$pnlTitle.Controls.Add($lblAppName)
+
+$lblSubtitle = New-Object System.Windows.Forms.Label
+$lblSubtitle.Text      = "Education Device Restriction Manager  •  v2.1"
+$lblSubtitle.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
+$lblSubtitle.ForeColor = $clrTextMuted
+$lblSubtitle.AutoSize  = $true
+$lblSubtitle.Location  = New-Object System.Drawing.Point(($MARGIN + 2), 44)
+$pnlTitle.Controls.Add($lblSubtitle)
+
+# ---------------------------------------------------------------
+# STATUS PANEL
+# ---------------------------------------------------------------
+$pnlStatus = New-Object System.Windows.Forms.Panel
+$pnlStatus.Size      = New-Object System.Drawing.Size($INNER, $H_STATUS)
+$pnlStatus.Location  = New-Object System.Drawing.Point($MARGIN, $Y_STATUS)
+$pnlStatus.BackColor = $clrPanel
+$form.Controls.Add($pnlStatus)
+
+# Coloured left-edge accent bar (painted in the panel's Paint event)
+$script:statusAccentColor = $clrGreen
+
+# Status dot
+$picDot = New-Object System.Windows.Forms.PictureBox
+$picDot.Size      = New-Object System.Drawing.Size(14, 14)
+$picDot.Location  = New-Object System.Drawing.Point(18, 16)
+$picDot.BackColor = [System.Drawing.Color]::Transparent
+$pnlStatus.Controls.Add($picDot)
+
+$script:dotColor = $clrGreen
+$picDot.Add_Paint({
+    param($s, $e)
+    $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $brush = New-Object System.Drawing.SolidBrush($script:dotColor)
+    $e.Graphics.FillEllipse($brush, 0, 0, 13, 13)
+    $brush.Dispose()
+})
+
+$lblStatusCap = New-Object System.Windows.Forms.Label
+$lblStatusCap.Text      = "SYSTEM STATUS"
+$lblStatusCap.Font      = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Bold)
+$lblStatusCap.ForeColor = $clrTextMuted
+$lblStatusCap.AutoSize  = $true
+$lblStatusCap.Location  = New-Object System.Drawing.Point(40, 16)
+$pnlStatus.Controls.Add($lblStatusCap)
+
+$lblStatusValue = New-Object System.Windows.Forms.Label
+$lblStatusValue.Text      = "NORMAL"
+$lblStatusValue.Font      = New-Object System.Drawing.Font("Segoe UI", 26, [System.Drawing.FontStyle]::Bold)
+$lblStatusValue.ForeColor = $clrGreen
+$lblStatusValue.AutoSize  = $true
+$lblStatusValue.Location  = New-Object System.Drawing.Point(38, 30)
+$pnlStatus.Controls.Add($lblStatusValue)
+
+$lblStatusSub = New-Object System.Windows.Forms.Label
+$lblStatusSub.Text      = "All internet traffic is unrestricted."
+$lblStatusSub.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
+$lblStatusSub.ForeColor = $clrTextMuted
+$lblStatusSub.Size      = New-Object System.Drawing.Size(440, 16)
+$lblStatusSub.Location  = New-Object System.Drawing.Point(40, 68)
+$pnlStatus.Controls.Add($lblStatusSub)
+
+# ---------------------------------------------------------------
+# CONFIGURATION PANEL  (read-only display)
+# ---------------------------------------------------------------
+$pnlCfg = New-Object System.Windows.Forms.Panel
+$pnlCfg.Size      = New-Object System.Drawing.Size($INNER, $H_CFG)
+$pnlCfg.Location  = New-Object System.Drawing.Point($MARGIN, $Y_CFG)
+$pnlCfg.BackColor = $clrPanel
+$form.Controls.Add($pnlCfg)
+
+$lblCfgCap = New-Object System.Windows.Forms.Label
+$lblCfgCap.Text      = "ACTIVE CONFIGURATION"
+$lblCfgCap.Font      = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Bold)
+$lblCfgCap.ForeColor = $clrTextMuted
+$lblCfgCap.AutoSize  = $true
+$lblCfgCap.Location  = New-Object System.Drawing.Point(16, 10)
+$pnlCfg.Controls.Add($lblCfgCap)
+
+function New-CfgRow {
+    param([string]$Cap, [string]$Val, [int]$Y, [System.Windows.Forms.Panel]$P)
+    $lc = New-Object System.Windows.Forms.Label
+    $lc.Text      = $Cap.ToUpper()
+    $lc.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
+    $lc.ForeColor = $clrTextMuted
+    $lc.Size      = New-Object System.Drawing.Size(140, 18)
+    $lc.Location  = New-Object System.Drawing.Point(16, $Y)
+    $P.Controls.Add($lc)
+
+    $lv = New-Object System.Windows.Forms.Label
+    $lv.Text      = $Val
+    $lv.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+    $lv.ForeColor = $clrTextPrimary
+    $lv.Size      = New-Object System.Drawing.Size(330, 18)
+    $lv.Location  = New-Object System.Drawing.Point(158, $Y)
+    $P.Controls.Add($lv)
+    return $lv
+}
+
+$valDomain  = New-CfgRow "Whitelist Domain" $CONFIG.WhitelistDomain              30 $pnlCfg
+$valProxy   = New-CfgRow "Black-hole Proxy" $CONFIG.BlackHoleProxy               56 $pnlCfg
+$valDMH     = New-CfgRow "Auto-restore"     "$($CONFIG.DeadManHours)h via Dead Man's Switch" 82 $pnlCfg
+
+# ---------------------------------------------------------------
+# DEAD MAN'S SWITCH STATUS BAR  (hidden when not locked)
+# ---------------------------------------------------------------
+$pnlDMS = New-Object System.Windows.Forms.Panel
+$pnlDMS.Size      = New-Object System.Drawing.Size($INNER, $H_DMS)
+$pnlDMS.Location  = New-Object System.Drawing.Point($MARGIN, $Y_DMS)
+$pnlDMS.BackColor = [System.Drawing.Color]::FromArgb(60, 50, 20)
+$pnlDMS.Visible   = $false
+$form.Controls.Add($pnlDMS)
+
+$lblDMSText = New-Object System.Windows.Forms.Label
+$lblDMSText.Text      = "Dead Man's Switch active — auto-restore at --:--"
+$lblDMSText.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+$lblDMSText.ForeColor = $clrAmber
+$lblDMSText.Size      = New-Object System.Drawing.Size(460, 18)
+$lblDMSText.Location  = New-Object System.Drawing.Point(16, 13)
+$pnlDMS.Controls.Add($lblDMSText)
+
+# ---------------------------------------------------------------
+# CONFIG BUTTON  — always visible, opens the settings dialog
+# ---------------------------------------------------------------
+$btnConfig = New-Object System.Windows.Forms.Button
+$btnConfig.Size      = New-Object System.Drawing.Size($INNER, $H_BTN_CFG)
+$btnConfig.Location  = New-Object System.Drawing.Point($MARGIN, $Y_BTN_CFG)
+$btnConfig.FlatStyle = "Flat"
+$btnConfig.FlatAppearance.BorderSize  = 1
+$btnConfig.FlatAppearance.BorderColor = $clrBorder
+$btnConfig.BackColor = $clrAccentCfg
+$btnConfig.ForeColor = [System.Drawing.Color]::White
+$btnConfig.Text      = "EDIT CONFIGURATION"
+$btnConfig.Font      = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$btnConfig.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$form.Controls.Add($btnConfig)
+
+# ---------------------------------------------------------------
+# ACTION BUTTON  — Lockdown / Restore
+# ---------------------------------------------------------------
+$btnAction = New-Object System.Windows.Forms.Button
+$btnAction.Size      = New-Object System.Drawing.Size($INNER, $H_BTN_ACT)
+$btnAction.Location  = New-Object System.Drawing.Point($MARGIN, $Y_BTN_ACT)
+$btnAction.FlatStyle = "Flat"
+$btnAction.FlatAppearance.BorderSize = 0
+$btnAction.BackColor = $clrAccentLock
+$btnAction.ForeColor = [System.Drawing.Color]::White
+$btnAction.Text      = "ACTIVATE LOCKDOWN"
+$btnAction.Font      = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+$btnAction.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$form.Controls.Add($btnAction)
+
+# ---------------------------------------------------------------
+# ACTIVITY LOG
+# ---------------------------------------------------------------
+$lblLogCap = New-Object System.Windows.Forms.Label
+$lblLogCap.Text      = "ACTIVITY LOG"
+$lblLogCap.Font      = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Bold)
+$lblLogCap.ForeColor = $clrTextMuted
+$lblLogCap.AutoSize  = $true
+$lblLogCap.Location  = New-Object System.Drawing.Point($MARGIN, $Y_LOG_LBL)
+$form.Controls.Add($lblLogCap)
+
+$txtLog = New-Object System.Windows.Forms.RichTextBox
+$txtLog.Size        = New-Object System.Drawing.Size($INNER, $H_LOG)
+$txtLog.Location    = New-Object System.Drawing.Point($MARGIN, $Y_LOG)
+$txtLog.BackColor   = $clrPanel
+$txtLog.ForeColor   = $clrTextMuted
+$txtLog.Font        = New-Object System.Drawing.Font("Consolas", 8)
+$txtLog.ReadOnly    = $true
+$txtLog.BorderStyle = "None"
+$txtLog.ScrollBars  = "Vertical"
+$form.Controls.Add($txtLog)
+
+# ---------------------------------------------------------------
+# WRITE-UILOG HELPER
+# ---------------------------------------------------------------
+function Write-UILog {
+    param([string]$Msg, [string]$Level = "INFO")
+    $ts    = Get-Date -Format "HH:mm:ss"
+    $color = switch ($Level) {
+        "ERROR" { $clrRed   }
+        "WARN"  { $clrAmber }
+        "OK"    { $clrGreen }
+        default { $clrTextMuted }
+    }
+    $txtLog.SelectionStart  = $txtLog.TextLength
+    $txtLog.SelectionLength = 0
+    $txtLog.SelectionColor  = $clrTextMuted
+    $txtLog.AppendText("[$ts] ")
+    $txtLog.SelectionColor  = $color
+    $txtLog.AppendText("$Msg`n")
+    $txtLog.ScrollToCaret()
+}
+
+# ---------------------------------------------------------------
+# PANEL BORDER PAINTER
+# ---------------------------------------------------------------
+foreach ($pnl in @($pnlStatus, $pnlCfg)) {
+    $pnl.Add_Paint({
+        param($s, $e)
+        $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+        $pen  = New-Object System.Drawing.Pen($clrBorder, 1)
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        try {
+            $path = [GfxHelper]::RoundedRect($rect, 5)
+            $e.Graphics.DrawPath($pen, $path)
+            $path.Dispose()
+        } catch { $e.Graphics.DrawRectangle($pen, $rect) }
+        $pen.Dispose()
+    })
+}
+
+# ---------------------------------------------------------------
+# CONFIG DIALOG FUNCTION
+# ---------------------------------------------------------------
+function Show-ConfigDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "Edit Configuration"
+    $dlg.ClientSize      = New-Object System.Drawing.Size(460, 310)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrBg
+    $dlg.ForeColor       = $clrTextPrimary
+    $dlg.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dlg.Icon            = [System.Drawing.SystemIcons]::Shield
+
+    function Add-DlgRow {
+        param([string]$Cap, [string]$Val, [string]$Hint, [int]$Y)
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text      = $Cap
+        $lbl.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+        $lbl.ForeColor = $clrTextMuted
+        $lbl.Size      = New-Object System.Drawing.Size(420, 16)
+        $lbl.Location  = New-Object System.Drawing.Point(20, $Y)
+        $dlg.Controls.Add($lbl)
+
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Text      = $Val
+        $tb.Font      = New-Object System.Drawing.Font("Consolas", 10)
+        $tb.BackColor = [System.Drawing.Color]::FromArgb(32, 36, 46)
+        $tb.ForeColor = $clrTextPrimary
+        $tb.BorderStyle = "FixedSingle"
+        $tb.Size      = New-Object System.Drawing.Size(420, 24)
+        $tb.Location  = New-Object System.Drawing.Point(20, ($Y + 18))
+        $dlg.Controls.Add($tb)
+
+        $hint = New-Object System.Windows.Forms.Label
+        $hint.Text      = $Hint
+        $hint.Font      = New-Object System.Drawing.Font("Segoe UI", 7)
+        $hint.ForeColor = $clrTextMuted
+        $hint.Size      = New-Object System.Drawing.Size(420, 14)
+        $hint.Location  = New-Object System.Drawing.Point(20, ($Y + 44))
+        $dlg.Controls.Add($hint)
+
+        return $tb
+    }
+
+    $tbDomain = Add-DlgRow `
+        "Whitelist Domains  (comma-separated)" `
+        $CONFIG.WhitelistDomain `
+        "e.g.  school.edu, exam.org   — subdomains are whitelisted automatically for each" `
+        16
+
+    $tbProxy = Add-DlgRow `
+        "Black-hole Proxy  (nothing should be listening here)" `
+        $CONFIG.BlackHoleProxy `
+        "Default: 127.0.0.1:9999  — change only if that port is in use" `
+        90
+
+    $tbHours = Add-DlgRow `
+        "Dead Man's Switch — auto-restore after N hours" `
+        ([string]$CONFIG.DeadManHours) `
+        "Enter a whole number between 1 and 24" `
+        164
+
+    # Warning banner shown when system is locked
+    $lockWarn = New-Object System.Windows.Forms.Label
+    $lockWarn.Text      = "  Changes will take effect on the next lockdown cycle."
+    $lockWarn.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
+    $lockWarn.ForeColor = $clrAmber
+    $lockWarn.BackColor = [System.Drawing.Color]::FromArgb(50, 40, 10)
+    $lockWarn.Size      = New-Object System.Drawing.Size(420, 22)
+    $lockWarn.Location  = New-Object System.Drawing.Point(20, 238)
+    $lockWarn.Visible   = $script:IsLocked
+    $dlg.Controls.Add($lockWarn)
+
+    # Save button
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text      = "SAVE"
+    $btnSave.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $btnSave.Size      = New-Object System.Drawing.Size(200, 36)
+    $btnSave.Location  = New-Object System.Drawing.Point(20, 264)
+    $btnSave.FlatStyle = "Flat"
+    $btnSave.FlatAppearance.BorderSize = 0
+    $btnSave.BackColor = $clrAccentCfg
+    $btnSave.ForeColor = [System.Drawing.Color]::White
+    $btnSave.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $dlg.Controls.Add($btnSave)
+
+    # Cancel button
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text      = "CANCEL"
+    $btnCancel.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
+    $btnCancel.Size      = New-Object System.Drawing.Size(200, 36)
+    $btnCancel.Location  = New-Object System.Drawing.Point(240, 264)
+    $btnCancel.FlatStyle = "Flat"
+    $btnCancel.FlatAppearance.BorderColor = $clrBorder
+    $btnCancel.FlatAppearance.BorderSize  = 1
+    $btnCancel.BackColor = $clrPanel
+    $btnCancel.ForeColor = $clrTextMuted
+    $btnCancel.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $dlg.Controls.Add($btnCancel)
+
+    $btnCancel.Add_Click({ $dlg.Close() })
+
+    $btnSave.Add_Click({
+        # Validate hours field
+        $h = 0
+        if (-not [int]::TryParse($tbHours.Text.Trim(), [ref]$h) -or $h -lt 1 -or $h -gt 24) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Dead Man's Switch hours must be a whole number from 1 to 24.",
+                "Validation Error", "OK", "Warning") | Out-Null
+            return
+        }
+        # Validate domain list — at least one non-empty entry required
+        $domainList = $tbDomain.Text -split '\s*,\s*' | Where-Object { $_ -ne '' }
+        if ($domainList.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "At least one whitelist domain is required.",
+                "Validation Error", "OK", "Warning") | Out-Null
+            return
+        }
+
+        # Apply to CONFIG
+        $CONFIG.WhitelistDomain = ($domainList -join ', ').ToLower()
+        $CONFIG.BlackHoleProxy  = $tbProxy.Text.Trim()
+        $CONFIG.DeadManHours    = $h
+
+        # Refresh display labels on main form
+        $valDomain.Text = $CONFIG.WhitelistDomain
+        $valProxy.Text  = $CONFIG.BlackHoleProxy
+        $valDMH.Text    = "$($CONFIG.DeadManHours)h via Dead Man's Switch"
+
+        $domainCount = $domainList.Count
+        Write-UILog "Configuration updated: $domainCount domain(s) whitelisted, proxy=$($CONFIG.BlackHoleProxy), hours=$($CONFIG.DeadManHours)" "OK"
+        $dlg.Close()
+    })
+
+    $dlg.ShowDialog($form) | Out-Null
+}
+
+# ---------------------------------------------------------------
+# UPDATE-UI  — refreshes all state-driven controls
+# ---------------------------------------------------------------
+$script:IsLocked = $false
+
+function Update-UI {
+    $script:IsLocked = Test-LockdownFlag
+
+    if ($script:IsLocked) {
+        $lblStatusValue.Text      = "LOCKED"
+        $lblStatusValue.ForeColor = $clrRed
+        $lblStatusSub.Text        = "Internet restricted — only whitelisted domain passes."
+        $script:dotColor          = $clrRed
+        $btnAction.Text           = "RESTORE SYSTEM"
+        $btnAction.BackColor      = $clrAccentRest
+        $pnlDMS.Visible           = $true
+        $btnConfig.Enabled        = $true   # still allow config edits (takes effect next cycle)
+
+        $dmsTime = Get-DeadMansSwitchTime
+        if ($dmsTime) {
+            $lblDMSText.Text = "  Dead Man's Switch active — auto-restore scheduled at $dmsTime"
+        }
+    } else {
+        $lblStatusValue.Text      = "NORMAL"
+        $lblStatusValue.ForeColor = $clrGreen
+        $lblStatusSub.Text        = "All internet traffic is unrestricted."
+        $script:dotColor          = $clrGreen
+        $btnAction.Text           = "ACTIVATE LOCKDOWN"
+        $btnAction.BackColor      = $clrAccentLock
+        $pnlDMS.Visible           = $false
+        $btnConfig.Enabled        = $true
+    }
+
+    $picDot.Invalidate()
+    $form.Refresh()
+}
+
+# ---------------------------------------------------------------
+# BUTTON EVENT HANDLERS
+# ---------------------------------------------------------------
+$btnConfig.Add_Click({ Show-ConfigDialog })
+
+$btnAction.Add_Click({
+    $btnAction.Enabled  = $false
+    $btnConfig.Enabled  = $false
+    $btnAction.Text     = "WORKING..."
+
+    if (-not $script:IsLocked) {
+        Write-UILog "Initiating lockdown..." "INFO"
+        $ok = Invoke-Lockdown
+        if ($ok) {
+            Write-UILog "Lockdown ACTIVE — proxy: $($CONFIG.BlackHoleProxy)" "OK"
+            Write-UILog "Whitelist: $($CONFIG.WhitelistDomain) + subdomains" "OK"
+            Write-UILog "Dead Man's Switch fires in $($CONFIG.DeadManHours)h" "OK"
+        } else {
+            Write-UILog "Lockdown FAILED — see log file for details." "ERROR"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Lockdown failed. Check the activity log.",
+                "Error", "OK", "Error") | Out-Null
+        }
+    } else {
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Restore system to normal operation?",
+            "Confirm Restore", "YesNo", "Question")
+        if ($confirm -eq "Yes") {
+            Write-UILog "Initiating restore..." "INFO"
+            $ok = Invoke-Restore
+            if ($ok) {
+                Write-UILog "System RESTORED — all restrictions removed." "OK"
+            } else {
+                Write-UILog "Restore had errors — check: $LogFile" "ERROR"
+            }
+        } else {
+            Write-UILog "Restore cancelled by user." "WARN"
+        }
+    }
+
+    $btnAction.Enabled = $true
+    $btnConfig.Enabled = $true
+    Update-UI
+})
+
+# ---------------------------------------------------------------
+# STARTUP
+# ---------------------------------------------------------------
+Update-UI
+
+Write-UILog "Exam Lockdown Tool v2.1 started."
+Write-UILog "Host: $($env:COMPUTERNAME)  •  User: $($env:USERNAME)"
+
+if ($CONFIG.WhitelistDomain -eq "INSERT_DOMAIN_HERE" -or [string]::IsNullOrWhiteSpace($CONFIG.WhitelistDomain)) {
+    Write-UILog "No domain configured — click EDIT CONFIGURATION to set one." "WARN"
+}
+
+if ($script:IsLocked) {
+    Write-UILog "Existing lockdown detected — system is currently LOCKED." "WARN"
+} else {
+    Write-UILog "System is NORMAL. Ready to activate lockdown."
+}
+
+[System.Windows.Forms.Application]::Run($form)
+# ============================================================
+# END OF SCRIPT
+# ============================================================
