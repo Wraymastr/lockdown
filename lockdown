@@ -4,16 +4,22 @@
     Exam Lockdown Tool — A toggleable internet restriction utility for Windows education devices.
 
 .DESCRIPTION
-    This script provides a Windows Forms GUI to activate or deactivate an internet lockdown.
-    When locked:
+    This script provides a Windows Forms GUI with TWO mutually exclusive modes:
+
+    WHITELIST LOCKDOWN  (block everything, allow listed domains)
       - All HTTP/HTTPS traffic is routed through a black-hole proxy (127.0.0.1:9999)
       - One or more whitelisted domains (and their subdomains) bypass the proxy
       - Users are prevented from changing proxy settings manually
+
+    BLOCKLIST MODE  (allow everything, block listed domains)
+      - Each blocked domain is written to the Windows hosts file (0.0.0.0 and ::)
+      - "www." variants are added automatically; other subdomains must be listed individually
+      - Entries live between "# BEGIN ExamLockdown" / "# END ExamLockdown" markers,
+        so the tool never touches any other line in the hosts file
+
+    In both modes:
       - A Dead Man's Switch scheduled task auto-restores after N hours
-    When unlocked:
-      - All original proxy settings are restored from a backup
-      - The scheduled task is removed
-      - The flag and backup file are deleted
+      - Restore removes every change the active mode made
 
 .NOTES
     Must be run as Administrator.
@@ -37,12 +43,13 @@ $CONFIG = @{
     # Hours before the Dead Man's Switch auto-restores the system.
     DeadManHours        = 4
 
-    # Where to store the flag and backup files.
+    # Where to store the flag, backup and blocklist files.
     DataDir             = "$env:ProgramData\ExamLockdown"
 
     # Registry flag key path (HKLM — requires admin).
     FlagRegPath         = "HKLM:\SOFTWARE\ExamLockdown"
     FlagRegName         = "LockdownActive"
+    ModeRegName         = "LockdownMode"     # "Whitelist" or "Blocklist"
 
     # Scheduled task name for the Dead Man's Switch.
     TaskName            = "ExamLockdown_DeadMansSwitch"
@@ -63,8 +70,8 @@ function Test-Administrator {
 
 if (-not (Test-Administrator)) {
     # Re-launch with elevation if not already admin.
-    $args = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    Start-Process powershell.exe -ArgumentList $args -Verb RunAs
+    $relaunchArgs = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process powershell.exe -ArgumentList $relaunchArgs -Verb RunAs
     exit
 }
 
@@ -85,7 +92,7 @@ function Write-Log {
 }
 
 # ============================================================
-# REGION: REGISTRY PROXY HELPERS
+# REGION: REGISTRY PROXY HELPERS  (Whitelist mode)
 # ============================================================
 $ProxyRegPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 $IEPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Control Panel"
@@ -152,7 +159,7 @@ function Unlock-ProxyUI {
 }
 
 # ============================================================
-# REGION: FLAG MANAGEMENT
+# REGION: FLAG + MODE MANAGEMENT
 # ============================================================
 function Test-LockdownFlag {
     try {
@@ -161,11 +168,22 @@ function Test-LockdownFlag {
     } catch { return $false }
 }
 
+function Get-LockdownMode {
+    <# Returns "Blocklist" or "Whitelist". A flag with no mode value (older versions) is Whitelist. #>
+    try {
+        $val = Get-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.ModeRegName -ErrorAction SilentlyContinue
+        if ($null -ne $val -and $val.($CONFIG.ModeRegName) -eq "Blocklist") { return "Blocklist" }
+    } catch {}
+    return "Whitelist"
+}
+
 function Set-LockdownFlag {
+    param([string]$Mode = "Whitelist")
     try {
         if (-not (Test-Path $CONFIG.FlagRegPath)) { New-Item -Path $CONFIG.FlagRegPath -Force | Out-Null }
+        Set-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.ModeRegName -Value $Mode -Type String -Force
         Set-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.FlagRegName -Value 1 -Type DWord -Force
-        Write-Log "Lockdown flag set."
+        Write-Log "Lockdown flag set (mode: $Mode)."
     } catch { Write-Log "Set-LockdownFlag error: $_" "ERROR" }
 }
 
@@ -173,13 +191,14 @@ function Remove-LockdownFlag {
     try {
         if (Test-Path $CONFIG.FlagRegPath) {
             Remove-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.FlagRegName -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $CONFIG.FlagRegPath -Name $CONFIG.ModeRegName -ErrorAction SilentlyContinue
         }
         Write-Log "Lockdown flag removed."
     } catch { Write-Log "Remove-LockdownFlag error: $_" "WARN" }
 }
 
 # ============================================================
-# REGION: BACKUP / RESTORE
+# REGION: PROXY BACKUP / RESTORE  (Whitelist mode)
 # ============================================================
 $BackupFile = Join-Path $CONFIG.DataDir "proxy_backup.json"
 
@@ -240,6 +259,137 @@ function Invoke-DNSFlush {
 }
 
 # ============================================================
+# REGION: BLOCKLIST STORAGE + HOSTS FILE  (Blocklist mode)
+# ============================================================
+$BlocklistFile = Join-Path $CONFIG.DataDir "blocklist.json"
+$HostsPath     = Join-Path $env:SystemRoot "System32\drivers\etc\hosts"
+$HostsBackup   = Join-Path $CONFIG.DataDir "hosts_backup.txt"
+$HostsBegin    = "# BEGIN ExamLockdown"
+$HostsEnd      = "# END ExamLockdown"
+
+function ConvertTo-CleanHostname {
+    <# Normalises user input (URLs, ports, paths) to a bare hostname. Returns $null if invalid. #>
+    param([string]$Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    $h = $Raw.Trim().ToLower()
+    $h = $h -replace '^[a-z][a-z0-9+.-]*://', ''   # scheme
+    $h = $h -replace '[/?#].*$', ''                # path / query / fragment
+    $h = $h -replace '^[^@]*@', ''                 # user@
+    $h = $h -replace ':\d+$', ''                   # :port
+    $h = $h -replace '^\*\.', ''                   # leading wildcard (hosts has no wildcards)
+    $h = $h.TrimEnd('.')
+    $pattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])$'
+    if ($h -match $pattern -and $h -notmatch '^[\d.]+$') { return $h }
+    return $null
+}
+
+function Get-Blocklist {
+    if (Test-Path $BlocklistFile) {
+        try {
+            $raw = Get-Content -Path $BlocklistFile -Raw -Encoding UTF8
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $items = @(ConvertFrom-Json -InputObject $raw) | Where-Object { $_ }
+                return @($items | ForEach-Object { [string]$_ })
+            }
+        } catch { Write-Log "Get-Blocklist error: $_" "WARN" }
+    }
+    return @()
+}
+
+function Save-Blocklist {
+    param([string[]]$List)
+    if (-not (Test-Path $CONFIG.DataDir)) { New-Item -Path $CONFIG.DataDir -ItemType Directory -Force | Out-Null }
+    ConvertTo-Json -InputObject @($List) | Set-Content -Path $BlocklistFile -Encoding UTF8 -Force
+}
+
+function Get-HostsEntries {
+    <# Expands domains into the full set of hostnames to write (domain + www variant), de-duplicated. #>
+    param([string[]]$Domains)
+    $set = New-Object 'System.Collections.Generic.SortedSet[string]'
+    foreach ($d in $Domains) {
+        if ([string]::IsNullOrWhiteSpace($d)) { continue }
+        [void]$set.Add($d)
+        if ($d.StartsWith("www.")) {
+            $bare = $d.Substring(4)
+            if ($bare -match '\.') { [void]$set.Add($bare) }
+        } else {
+            [void]$set.Add("www.$d")
+        }
+    }
+    return @($set)
+}
+
+function Remove-HostsBlockText {
+    param([string]$Text)
+    $pattern = "(?ms)^[ \t]*" + [regex]::Escape($HostsBegin) + ".*?^[ \t]*" + [regex]::Escape($HostsEnd) + "[ \t]*\r?\n?"
+    return [regex]::Replace($Text, $pattern, "")
+}
+
+function Save-HostsText {
+    param([string]$Text)
+    $item = Get-Item -Path $HostsPath -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+        Set-ItemProperty -Path $HostsPath -Name IsReadOnly -Value $false
+    }
+    [System.IO.File]::WriteAllText($HostsPath, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Backup-HostsFile {
+    <# One-time copy of the original hosts file, taken before the first modification. #>
+    try {
+        if (-not (Test-Path $CONFIG.DataDir)) { New-Item -Path $CONFIG.DataDir -ItemType Directory -Force | Out-Null }
+        if (-not (Test-Path $HostsBackup)) {
+            Copy-Item -Path $HostsPath -Destination $HostsBackup -Force
+            Write-Log "Original hosts file backed up to $HostsBackup."
+        }
+    } catch { Write-Log "Backup-HostsFile error: $_" "WARN" }
+}
+
+function Write-HostsBlock {
+    <# Replaces our marked block in the hosts file with entries for $Domains. Throws on failure. #>
+    param([string[]]$Domains)
+    $text = Remove-HostsBlockText ([System.IO.File]::ReadAllText($HostsPath))
+    if ($text.Length -gt 0 -and -not $text.EndsWith("`n")) { $text += "`r`n" }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add($HostsBegin)
+    $lines.Add("# Managed by Exam Lockdown Tool - do not edit between these markers")
+    $hosts = Get-HostsEntries $Domains
+    foreach ($h in $hosts) {
+        $lines.Add("0.0.0.0 $h")
+        $lines.Add(":: $h")
+    }
+    $lines.Add($HostsEnd)
+    $text += ($lines -join "`r`n") + "`r`n"
+
+    Save-HostsText $text
+
+    # Verify the write actually landed.
+    $check = [System.IO.File]::ReadAllText($HostsPath)
+    if ($check -notmatch [regex]::Escape($HostsBegin)) { throw "Hosts file write could not be verified." }
+    Write-Log "Hosts block written: $($hosts.Count) hostname(s) from $(@($Domains).Count) domain(s)."
+}
+
+function Remove-HostsBlock {
+    <# Removes only our marked block; every other hosts entry is left untouched. Throws on failure. #>
+    if (-not (Test-Path $HostsPath)) { return }
+    $text = [System.IO.File]::ReadAllText($HostsPath)
+    if ($text -match [regex]::Escape($HostsBegin)) {
+        Save-HostsText (Remove-HostsBlockText $text)
+        Write-Log "Hosts block removed."
+    }
+}
+
+function Update-LiveBlocklist {
+    <# If Blocklist mode is currently active, push list changes to the hosts file immediately. #>
+    param([string[]]$List)
+    if ((Test-LockdownFlag) -and (Get-LockdownMode) -eq "Blocklist") {
+        if (@($List).Count -eq 0) { Remove-HostsBlock } else { Write-HostsBlock -Domains $List }
+        Invoke-DNSFlush
+    }
+}
+
+# ============================================================
 # REGION: DEAD MAN'S SWITCH (Scheduled Task)
 # ============================================================
 function Register-DeadMansSwitch {
@@ -294,7 +444,8 @@ function Get-DeadMansSwitchTime {
 # REGION: CORE LOCKDOWN / RESTORE LOGIC
 # ============================================================
 function Invoke-Lockdown {
-    Write-Log "===== LOCKDOWN INITIATED ====="
+    <# WHITELIST mode: black-hole proxy + bypass list. #>
+    Write-Log "===== LOCKDOWN INITIATED (Whitelist) ====="
     try {
         Save-ProxyBackup
 
@@ -308,7 +459,7 @@ function Invoke-Lockdown {
 
         Lock-ProxyUI
         Invoke-DNSFlush
-        Set-LockdownFlag
+        Set-LockdownFlag -Mode "Whitelist"
         Register-DeadMansSwitch -Hours $CONFIG.DeadManHours
 
         Write-Log "Lockdown complete. Whitelist: $override"
@@ -323,15 +474,48 @@ function Invoke-Lockdown {
     }
 }
 
-function Invoke-Restore {
-    Write-Log "===== RESTORE INITIATED ====="
+function Invoke-BlocklistStart {
+    <# BLOCKLIST mode: write blocked domains to the hosts file. #>
+    Write-Log "===== BLOCKLIST MODE INITIATED ====="
     try {
-        Restore-ProxyBackup
-        Unlock-ProxyUI
+        $list = @(Get-Blocklist)
+        if ($list.Count -eq 0) { throw "Blocklist is empty." }
+
+        Backup-HostsFile
+        Write-HostsBlock -Domains $list
         Invoke-DNSFlush
-        Unregister-DeadMansSwitch
-        Remove-LockdownFlag
-        Remove-BackupFile
+        Set-LockdownFlag -Mode "Blocklist"
+        Register-DeadMansSwitch -Hours $CONFIG.DeadManHours
+
+        Write-Log "Blocklist mode active: $($list.Count) domain(s)."
+        return $true
+    } catch {
+        Write-Log "BLOCKLIST START FAILED: $_" "ERROR"
+        # Attempt rollback.
+        try { Remove-HostsBlock   } catch {}
+        try { Invoke-DNSFlush     } catch {}
+        try { Remove-LockdownFlag } catch {}
+        return $false
+    }
+}
+
+function Invoke-Restore {
+    $mode = Get-LockdownMode
+    Write-Log "===== RESTORE INITIATED ($mode) ====="
+    try {
+        if ($mode -eq "Blocklist") {
+            Remove-HostsBlock
+            Invoke-DNSFlush
+            Unregister-DeadMansSwitch
+            Remove-LockdownFlag
+        } else {
+            Restore-ProxyBackup
+            Unlock-ProxyUI
+            Invoke-DNSFlush
+            Unregister-DeadMansSwitch
+            Remove-LockdownFlag
+            Remove-BackupFile
+        }
         Write-Log "Restore complete."
         return $true
     } catch {
@@ -370,6 +554,8 @@ $clrAmber       = [System.Drawing.Color]::FromArgb(255, 185,  50)
 $clrAccentLock  = [System.Drawing.Color]::FromArgb(200,  45,  65)
 $clrAccentRest  = [System.Drawing.Color]::FromArgb(35,  160, 110)
 $clrAccentCfg   = [System.Drawing.Color]::FromArgb(40,   90, 160)
+$clrAccentBlock = [System.Drawing.Color]::FromArgb(190, 120,  20)
+$clrInput       = [System.Drawing.Color]::FromArgb(32,  36,  46)
 
 # ---------------------------------------------------------------
 # GfxHelper for rounded rectangles
@@ -400,7 +586,9 @@ $MARGIN  = 20    # left/right margin
 $INNER   = $W - ($MARGIN * 2)   # 500px panel width
 $Y_TITLE = 0
 $H_TITLE = 72
-$Y_STATUS = $H_TITLE + 12
+$Y_MODE  = $H_TITLE + 12
+$H_MODE  = 40
+$Y_STATUS = $Y_MODE + $H_MODE + 10
 $H_STATUS = 90
 $Y_CFG   = $Y_STATUS + $H_STATUS + 12
 $H_CFG   = 112
@@ -447,12 +635,37 @@ $lblAppName.Location  = New-Object System.Drawing.Point($MARGIN, 12)
 $pnlTitle.Controls.Add($lblAppName)
 
 $lblSubtitle = New-Object System.Windows.Forms.Label
-$lblSubtitle.Text      = "Education Device Restriction Manager  •  v2.1"
+$lblSubtitle.Text      = "Education Device Restriction Manager  •  v2.2"
 $lblSubtitle.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
 $lblSubtitle.ForeColor = $clrTextMuted
 $lblSubtitle.AutoSize  = $true
 $lblSubtitle.Location  = New-Object System.Drawing.Point(($MARGIN + 2), 44)
 $pnlTitle.Controls.Add($lblSubtitle)
+
+# ---------------------------------------------------------------
+# MODE SELECTOR  (locked while a mode is active)
+# ---------------------------------------------------------------
+$MODE_BTN_W = [int](($INNER - 8) / 2)
+
+$btnModeWL = New-Object System.Windows.Forms.Button
+$btnModeWL.Size      = New-Object System.Drawing.Size($MODE_BTN_W, $H_MODE)
+$btnModeWL.Location  = New-Object System.Drawing.Point($MARGIN, $Y_MODE)
+$btnModeWL.FlatStyle = "Flat"
+$btnModeWL.FlatAppearance.BorderSize = 1
+$btnModeWL.Text      = "WHITELIST LOCKDOWN"
+$btnModeWL.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnModeWL.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$form.Controls.Add($btnModeWL)
+
+$btnModeBL = New-Object System.Windows.Forms.Button
+$btnModeBL.Size      = New-Object System.Drawing.Size($MODE_BTN_W, $H_MODE)
+$btnModeBL.Location  = New-Object System.Drawing.Point(($MARGIN + $MODE_BTN_W + 8), $Y_MODE)
+$btnModeBL.FlatStyle = "Flat"
+$btnModeBL.FlatAppearance.BorderSize = 1
+$btnModeBL.Text      = "BLOCKLIST MODE"
+$btnModeBL.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnModeBL.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$form.Controls.Add($btnModeBL)
 
 # ---------------------------------------------------------------
 # STATUS PANEL
@@ -462,9 +675,6 @@ $pnlStatus.Size      = New-Object System.Drawing.Size($INNER, $H_STATUS)
 $pnlStatus.Location  = New-Object System.Drawing.Point($MARGIN, $Y_STATUS)
 $pnlStatus.BackColor = $clrPanel
 $form.Controls.Add($pnlStatus)
-
-# Coloured left-edge accent bar (painted in the panel's Paint event)
-$script:statusAccentColor = $clrGreen
 
 # Status dot
 $picDot = New-Object System.Windows.Forms.PictureBox
@@ -507,7 +717,7 @@ $lblStatusSub.Location  = New-Object System.Drawing.Point(40, 68)
 $pnlStatus.Controls.Add($lblStatusSub)
 
 # ---------------------------------------------------------------
-# CONFIGURATION PANEL  (read-only display)
+# CONFIGURATION PANEL  (read-only display; contents change with mode)
 # ---------------------------------------------------------------
 $pnlCfg = New-Object System.Windows.Forms.Panel
 $pnlCfg.Size      = New-Object System.Drawing.Size($INNER, $H_CFG)
@@ -524,6 +734,7 @@ $lblCfgCap.Location  = New-Object System.Drawing.Point(16, 10)
 $pnlCfg.Controls.Add($lblCfgCap)
 
 function New-CfgRow {
+    <# Returns @{ Cap = <label>; Val = <label> } so both can be updated when the mode changes. #>
     param([string]$Cap, [string]$Val, [int]$Y, [System.Windows.Forms.Panel]$P)
     $lc = New-Object System.Windows.Forms.Label
     $lc.Text      = $Cap.ToUpper()
@@ -540,12 +751,12 @@ function New-CfgRow {
     $lv.Size      = New-Object System.Drawing.Size(330, 18)
     $lv.Location  = New-Object System.Drawing.Point(158, $Y)
     $P.Controls.Add($lv)
-    return $lv
+    return @{ Cap = $lc; Val = $lv }
 }
 
-$valDomain  = New-CfgRow "Whitelist Domain" $CONFIG.WhitelistDomain              30 $pnlCfg
-$valProxy   = New-CfgRow "Black-hole Proxy" $CONFIG.BlackHoleProxy               56 $pnlCfg
-$valDMH     = New-CfgRow "Auto-restore"     "$($CONFIG.DeadManHours)h via Dead Man's Switch" 82 $pnlCfg
+$cfgRow1 = New-CfgRow "Whitelist Domain" $CONFIG.WhitelistDomain                          30 $pnlCfg
+$cfgRow2 = New-CfgRow "Black-hole Proxy" $CONFIG.BlackHoleProxy                           56 $pnlCfg
+$cfgRow3 = New-CfgRow "Auto-restore"     "$($CONFIG.DeadManHours)h via Dead Man's Switch" 82 $pnlCfg
 
 # ---------------------------------------------------------------
 # DEAD MAN'S SWITCH STATUS BAR  (hidden when not locked)
@@ -566,7 +777,7 @@ $lblDMSText.Location  = New-Object System.Drawing.Point(16, 13)
 $pnlDMS.Controls.Add($lblDMSText)
 
 # ---------------------------------------------------------------
-# CONFIG BUTTON  — always visible, opens the settings dialog
+# CONFIG BUTTON  — always visible; opens the dialog for the current mode
 # ---------------------------------------------------------------
 $btnConfig = New-Object System.Windows.Forms.Button
 $btnConfig.Size      = New-Object System.Drawing.Size($INNER, $H_BTN_CFG)
@@ -582,7 +793,7 @@ $btnConfig.Cursor    = [System.Windows.Forms.Cursors]::Hand
 $form.Controls.Add($btnConfig)
 
 # ---------------------------------------------------------------
-# ACTION BUTTON  — Lockdown / Restore
+# ACTION BUTTON  — Lockdown / Blocklist / Restore
 # ---------------------------------------------------------------
 $btnAction = New-Object System.Windows.Forms.Button
 $btnAction.Size      = New-Object System.Drawing.Size($INNER, $H_BTN_ACT)
@@ -658,7 +869,7 @@ foreach ($pnl in @($pnlStatus, $pnlCfg)) {
 }
 
 # ---------------------------------------------------------------
-# CONFIG DIALOG FUNCTION
+# CONFIG DIALOG FUNCTION  (Whitelist mode)
 # ---------------------------------------------------------------
 function Show-ConfigDialog {
     $dlg = New-Object System.Windows.Forms.Form
@@ -686,7 +897,7 @@ function Show-ConfigDialog {
         $tb = New-Object System.Windows.Forms.TextBox
         $tb.Text      = $Val
         $tb.Font      = New-Object System.Drawing.Font("Consolas", 10)
-        $tb.BackColor = [System.Drawing.Color]::FromArgb(32, 36, 46)
+        $tb.BackColor = $clrInput
         $tb.ForeColor = $clrTextPrimary
         $tb.BorderStyle = "FixedSingle"
         $tb.Size      = New-Object System.Drawing.Size(420, 24)
@@ -785,14 +996,193 @@ function Show-ConfigDialog {
         $CONFIG.BlackHoleProxy  = $tbProxy.Text.Trim()
         $CONFIG.DeadManHours    = $h
 
-        # Refresh display labels on main form
-        $valDomain.Text = $CONFIG.WhitelistDomain
-        $valProxy.Text  = $CONFIG.BlackHoleProxy
-        $valDMH.Text    = "$($CONFIG.DeadManHours)h via Dead Man's Switch"
-
         $domainCount = $domainList.Count
         Write-UILog "Configuration updated: $domainCount domain(s) whitelisted, proxy=$($CONFIG.BlackHoleProxy), hours=$($CONFIG.DeadManHours)" "OK"
         $dlg.Close()
+        Update-UI
+    })
+
+    $dlg.ShowDialog($form) | Out-Null
+}
+
+# ---------------------------------------------------------------
+# BLOCKLIST DIALOG FUNCTION  (Blocklist mode)
+# ---------------------------------------------------------------
+function Show-BlocklistDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "Manage Blocklist"
+    $dlg.ClientSize      = New-Object System.Drawing.Size(460, 436)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrBg
+    $dlg.ForeColor       = $clrTextPrimary
+    $dlg.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dlg.Icon            = [System.Drawing.SystemIcons]::Shield
+
+    $lblAdd = New-Object System.Windows.Forms.Label
+    $lblAdd.Text      = "Add domain(s) to block"
+    $lblAdd.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+    $lblAdd.ForeColor = $clrTextMuted
+    $lblAdd.Size      = New-Object System.Drawing.Size(420, 16)
+    $lblAdd.Location  = New-Object System.Drawing.Point(20, 16)
+    $dlg.Controls.Add($lblAdd)
+
+    $script:blTbAdd = New-Object System.Windows.Forms.TextBox
+    $script:blTbAdd.Font        = New-Object System.Drawing.Font("Consolas", 10)
+    $script:blTbAdd.BackColor   = $clrInput
+    $script:blTbAdd.ForeColor   = $clrTextPrimary
+    $script:blTbAdd.BorderStyle = "FixedSingle"
+    $script:blTbAdd.Size        = New-Object System.Drawing.Size(330, 24)
+    $script:blTbAdd.Location    = New-Object System.Drawing.Point(20, 36)
+    $dlg.Controls.Add($script:blTbAdd)
+
+    $btnAdd = New-Object System.Windows.Forms.Button
+    $btnAdd.Text      = "ADD"
+    $btnAdd.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $btnAdd.Size      = New-Object System.Drawing.Size(80, 26)
+    $btnAdd.Location  = New-Object System.Drawing.Point(360, 35)
+    $btnAdd.FlatStyle = "Flat"
+    $btnAdd.FlatAppearance.BorderSize = 0
+    $btnAdd.BackColor = $clrAccentCfg
+    $btnAdd.ForeColor = [System.Drawing.Color]::White
+    $btnAdd.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $dlg.Controls.Add($btnAdd)
+    $dlg.AcceptButton = $btnAdd
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text      = "e.g.  youtube.com  — www. is blocked automatically. Other subdomains (cdn.example.com) must be added individually. Separate several with commas."
+    $hint.Font      = New-Object System.Drawing.Font("Segoe UI", 7)
+    $hint.ForeColor = $clrTextMuted
+    $hint.Size      = New-Object System.Drawing.Size(420, 28)
+    $hint.Location  = New-Object System.Drawing.Point(20, 66)
+    $dlg.Controls.Add($hint)
+
+    $lblList = New-Object System.Windows.Forms.Label
+    $lblList.Text      = "BLOCKED DOMAINS"
+    $lblList.Font      = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Bold)
+    $lblList.ForeColor = $clrTextMuted
+    $lblList.AutoSize  = $true
+    $lblList.Location  = New-Object System.Drawing.Point(20, 104)
+    $dlg.Controls.Add($lblList)
+
+    $script:blList = New-Object System.Windows.Forms.ListBox
+    $script:blList.Font          = New-Object System.Drawing.Font("Consolas", 10)
+    $script:blList.BackColor     = $clrInput
+    $script:blList.ForeColor     = $clrTextPrimary
+    $script:blList.BorderStyle   = "FixedSingle"
+    $script:blList.SelectionMode = "MultiExtended"
+    $script:blList.Size          = New-Object System.Drawing.Size(420, 222)
+    $script:blList.Location      = New-Object System.Drawing.Point(20, 122)
+    $dlg.Controls.Add($script:blList)
+
+    $btnRemove = New-Object System.Windows.Forms.Button
+    $btnRemove.Text      = "REMOVE SELECTED"
+    $btnRemove.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $btnRemove.Size      = New-Object System.Drawing.Size(200, 36)
+    $btnRemove.Location  = New-Object System.Drawing.Point(20, 356)
+    $btnRemove.FlatStyle = "Flat"
+    $btnRemove.FlatAppearance.BorderSize = 0
+    $btnRemove.BackColor = $clrAccentLock
+    $btnRemove.ForeColor = [System.Drawing.Color]::White
+    $btnRemove.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $dlg.Controls.Add($btnRemove)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text      = "CLOSE"
+    $btnClose.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
+    $btnClose.Size      = New-Object System.Drawing.Size(200, 36)
+    $btnClose.Location  = New-Object System.Drawing.Point(240, 356)
+    $btnClose.FlatStyle = "Flat"
+    $btnClose.FlatAppearance.BorderColor = $clrBorder
+    $btnClose.FlatAppearance.BorderSize  = 1
+    $btnClose.BackColor = $clrPanel
+    $btnClose.ForeColor = $clrTextMuted
+    $btnClose.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $dlg.Controls.Add($btnClose)
+
+    $liveNote = New-Object System.Windows.Forms.Label
+    $liveNote.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
+    $liveNote.ForeColor = $clrAmber
+    $liveNote.BackColor = [System.Drawing.Color]::FromArgb(50, 40, 10)
+    $liveNote.Size      = New-Object System.Drawing.Size(420, 22)
+    $liveNote.Location  = New-Object System.Drawing.Point(20, 402)
+    if ($script:IsLocked) {
+        $liveNote.Text = "  Blocklist mode is ACTIVE — changes apply immediately."
+    } else {
+        $liveNote.Text = "  Changes are saved now and applied when the blocklist is activated."
+    }
+    $dlg.Controls.Add($liveNote)
+
+    # Load current list
+    $script:blList.Items.Clear()
+    foreach ($d in @(Get-Blocklist)) { [void]$script:blList.Items.Add($d) }
+
+    $btnClose.Add_Click({ $dlg.Close() })
+
+    $btnAdd.Add_Click({
+        $tokens = @($script:blTbAdd.Text -split '[,;\s]+' | Where-Object { $_ })
+        if ($tokens.Count -eq 0) { return }
+
+        $current = @(Get-Blocklist)
+        $added   = @()
+        $invalid = @()
+        $dupes   = @()
+        foreach ($t in $tokens) {
+            $c = ConvertTo-CleanHostname $t
+            if (-not $c)                                           { $invalid += $t }
+            elseif (($current -contains $c) -or ($added -contains $c)) { $dupes += $c }
+            else                                                   { $added += $c }
+        }
+
+        if ($invalid.Count -gt 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Not a valid domain name, skipped:`n`n" + ($invalid -join "`n"),
+                "Invalid Entry", "OK", "Warning") | Out-Null
+        }
+
+        if ($added.Count -gt 0) {
+            $newList = @(($current + $added) | Sort-Object -Unique)
+            try {
+                Save-Blocklist $newList
+                Update-LiveBlocklist $newList
+                Write-UILog "Blocklist: added $($added -join ', ')" "OK"
+                $script:blTbAdd.Clear()
+            } catch {
+                Write-UILog "Blocklist update failed: $_" "ERROR"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Could not update the hosts file:`n$_",
+                    "Error", "OK", "Error") | Out-Null
+            }
+            $script:blList.Items.Clear()
+            foreach ($d in @(Get-Blocklist)) { [void]$script:blList.Items.Add($d) }
+            Update-UI
+        } elseif ($dupes.Count -gt 0) {
+            Write-UILog "Already blocked: $($dupes -join ', ')" "WARN"
+            $script:blTbAdd.Clear()
+        }
+    })
+
+    $btnRemove.Add_Click({
+        $selected = @($script:blList.SelectedItems | ForEach-Object { [string]$_ })
+        if ($selected.Count -eq 0) { return }
+
+        $current = @(Get-Blocklist)
+        $newList = @($current | Where-Object { $selected -notcontains $_ })
+        try {
+            Save-Blocklist $newList
+            Update-LiveBlocklist $newList
+            Write-UILog "Blocklist: removed $($selected -join ', ')" "OK"
+        } catch {
+            Write-UILog "Blocklist update failed: $_" "ERROR"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not update the hosts file:`n$_",
+                "Error", "OK", "Error") | Out-Null
+        }
+        $script:blList.Items.Clear()
+        foreach ($d in @(Get-Blocklist)) { [void]$script:blList.Items.Add($d) }
+        Update-UI
     })
 
     $dlg.ShowDialog($form) | Out-Null
@@ -801,20 +1191,70 @@ function Show-ConfigDialog {
 # ---------------------------------------------------------------
 # UPDATE-UI  — refreshes all state-driven controls
 # ---------------------------------------------------------------
-$script:IsLocked = $false
+$script:IsLocked      = $false
+$script:SelectedMode  = "Whitelist"   # what the selector shows while unlocked
+$script:EffectiveMode = "Whitelist"   # active mode if locked, else selected mode
+
+function Set-ModeButtonStyle {
+    param([System.Windows.Forms.Button]$Btn, [bool]$Selected)
+    if ($Selected) {
+        $Btn.BackColor = $clrAccentCfg
+        $Btn.ForeColor = [System.Drawing.Color]::White
+        $Btn.FlatAppearance.BorderColor = $clrAccentCfg
+    } else {
+        $Btn.BackColor = $clrPanel
+        $Btn.ForeColor = $clrTextMuted
+        $Btn.FlatAppearance.BorderColor = $clrBorder
+    }
+}
 
 function Update-UI {
-    $script:IsLocked = Test-LockdownFlag
+    $script:IsLocked      = Test-LockdownFlag
+    $script:EffectiveMode = if ($script:IsLocked) { Get-LockdownMode } else { $script:SelectedMode }
+    $isBL    = ($script:EffectiveMode -eq "Blocklist")
+    $blCount = @(Get-Blocklist).Count
 
+    # --- Mode selector ---
+    Set-ModeButtonStyle $btnModeWL (-not $isBL)
+    Set-ModeButtonStyle $btnModeBL $isBL
+    $btnModeWL.Enabled = (-not $script:IsLocked)
+    $btnModeBL.Enabled = (-not $script:IsLocked)
+
+    # --- Configuration panel (mode-specific) ---
+    if ($isBL) {
+        $lblCfgCap.Text = "BLOCKLIST CONFIGURATION"
+        $cfgRow1.Cap.Text = "BLOCKED DOMAINS"
+        $cfgRow1.Val.Text = "$blCount domain(s)  (+ www. variants)"
+        $cfgRow2.Cap.Text = "METHOD"
+        $cfgRow2.Val.Text = "Hosts file  (0.0.0.0 and ::)"
+        $btnConfig.Text   = "MANAGE BLOCKLIST"
+    } else {
+        $lblCfgCap.Text = "ACTIVE CONFIGURATION"
+        $cfgRow1.Cap.Text = "WHITELIST DOMAIN"
+        $cfgRow1.Val.Text = $CONFIG.WhitelistDomain
+        $cfgRow2.Cap.Text = "BLACK-HOLE PROXY"
+        $cfgRow2.Val.Text = $CONFIG.BlackHoleProxy
+        $btnConfig.Text   = "EDIT CONFIGURATION"
+    }
+    $cfgRow3.Val.Text = "$($CONFIG.DeadManHours)h via Dead Man's Switch"
+
+    # --- Status + action button ---
     if ($script:IsLocked) {
-        $lblStatusValue.Text      = "LOCKED"
-        $lblStatusValue.ForeColor = $clrRed
-        $lblStatusSub.Text        = "Internet restricted — only whitelisted domain passes."
-        $script:dotColor          = $clrRed
-        $btnAction.Text           = "RESTORE SYSTEM"
-        $btnAction.BackColor      = $clrAccentRest
-        $pnlDMS.Visible           = $true
-        $btnConfig.Enabled        = $true   # still allow config edits (takes effect next cycle)
+        if ($isBL) {
+            $lblStatusValue.Text      = "BLOCKING"
+            $lblStatusValue.ForeColor = $clrAmber
+            $lblStatusSub.Text        = "Blocklist active — $blCount domain(s) blocked, everything else open."
+            $script:dotColor          = $clrAmber
+        } else {
+            $lblStatusValue.Text      = "LOCKED"
+            $lblStatusValue.ForeColor = $clrRed
+            $lblStatusSub.Text        = "Internet restricted — only whitelisted domain passes."
+            $script:dotColor          = $clrRed
+        }
+        $btnAction.Text      = "RESTORE SYSTEM"
+        $btnAction.BackColor = $clrAccentRest
+        $pnlDMS.Visible      = $true
+        $btnConfig.Enabled   = $true   # whitelist edits apply next cycle; blocklist edits apply live
 
         $dmsTime = Get-DeadMansSwitchTime
         if ($dmsTime) {
@@ -825,10 +1265,15 @@ function Update-UI {
         $lblStatusValue.ForeColor = $clrGreen
         $lblStatusSub.Text        = "All internet traffic is unrestricted."
         $script:dotColor          = $clrGreen
-        $btnAction.Text           = "ACTIVATE LOCKDOWN"
-        $btnAction.BackColor      = $clrAccentLock
-        $pnlDMS.Visible           = $false
-        $btnConfig.Enabled        = $true
+        if ($isBL) {
+            $btnAction.Text      = "ACTIVATE BLOCKLIST"
+            $btnAction.BackColor = $clrAccentBlock
+        } else {
+            $btnAction.Text      = "ACTIVATE LOCKDOWN"
+            $btnAction.BackColor = $clrAccentLock
+        }
+        $pnlDMS.Visible    = $false
+        $btnConfig.Enabled = $true
     }
 
     $picDot.Invalidate()
@@ -838,7 +1283,19 @@ function Update-UI {
 # ---------------------------------------------------------------
 # BUTTON EVENT HANDLERS
 # ---------------------------------------------------------------
-$btnConfig.Add_Click({ Show-ConfigDialog })
+$btnModeWL.Add_Click({
+    $script:SelectedMode = "Whitelist"
+    Update-UI
+})
+
+$btnModeBL.Add_Click({
+    $script:SelectedMode = "Blocklist"
+    Update-UI
+})
+
+$btnConfig.Add_Click({
+    if ($script:EffectiveMode -eq "Blocklist") { Show-BlocklistDialog } else { Show-ConfigDialog }
+})
 
 $btnAction.Add_Click({
     $btnAction.Enabled  = $false
@@ -846,17 +1303,41 @@ $btnAction.Add_Click({
     $btnAction.Text     = "WORKING..."
 
     if (-not $script:IsLocked) {
-        Write-UILog "Initiating lockdown..." "INFO"
-        $ok = Invoke-Lockdown
-        if ($ok) {
-            Write-UILog "Lockdown ACTIVE — proxy: $($CONFIG.BlackHoleProxy)" "OK"
-            Write-UILog "Whitelist: $($CONFIG.WhitelistDomain) + subdomains" "OK"
-            Write-UILog "Dead Man's Switch fires in $($CONFIG.DeadManHours)h" "OK"
+        if ($script:SelectedMode -eq "Blocklist") {
+            # ---------- START BLOCKLIST MODE ----------
+            $blCount = @(Get-Blocklist).Count
+            if ($blCount -eq 0) {
+                Write-UILog "Blocklist is empty — add domains first." "WARN"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "The blocklist is empty. Click MANAGE BLOCKLIST and add at least one domain first.",
+                    "Nothing to Block", "OK", "Information") | Out-Null
+            } else {
+                Write-UILog "Activating blocklist mode..." "INFO"
+                $ok = Invoke-BlocklistStart
+                if ($ok) {
+                    Write-UILog "Blocklist ACTIVE — $blCount domain(s) blocked via hosts file" "OK"
+                    Write-UILog "Dead Man's Switch fires in $($CONFIG.DeadManHours)h" "OK"
+                } else {
+                    Write-UILog "Blocklist activation FAILED — see log file for details." "ERROR"
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Could not activate blocklist mode. Check the activity log.",
+                        "Error", "OK", "Error") | Out-Null
+                }
+            }
         } else {
-            Write-UILog "Lockdown FAILED — see log file for details." "ERROR"
-            [System.Windows.Forms.MessageBox]::Show(
-                "Lockdown failed. Check the activity log.",
-                "Error", "OK", "Error") | Out-Null
+            # ---------- START WHITELIST LOCKDOWN ----------
+            Write-UILog "Initiating lockdown..." "INFO"
+            $ok = Invoke-Lockdown
+            if ($ok) {
+                Write-UILog "Lockdown ACTIVE — proxy: $($CONFIG.BlackHoleProxy)" "OK"
+                Write-UILog "Whitelist: $($CONFIG.WhitelistDomain) + subdomains" "OK"
+                Write-UILog "Dead Man's Switch fires in $($CONFIG.DeadManHours)h" "OK"
+            } else {
+                Write-UILog "Lockdown FAILED — see log file for details." "ERROR"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Lockdown failed. Check the activity log.",
+                    "Error", "OK", "Error") | Out-Null
+            }
         }
     } else {
         $confirm = [System.Windows.Forms.MessageBox]::Show(
@@ -885,17 +1366,16 @@ $btnAction.Add_Click({
 # ---------------------------------------------------------------
 Update-UI
 
-Write-UILog "Exam Lockdown Tool v2.1 started."
+Write-UILog "Exam Lockdown Tool v2.2 started."
 Write-UILog "Host: $($env:COMPUTERNAME)  •  User: $($env:USERNAME)"
 
-if ($CONFIG.WhitelistDomain -eq "INSERT_DOMAIN_HERE" -or [string]::IsNullOrWhiteSpace($CONFIG.WhitelistDomain)) {
-    Write-UILog "No domain configured — click EDIT CONFIGURATION to set one." "WARN"
-}
-
 if ($script:IsLocked) {
-    Write-UILog "Existing lockdown detected — system is currently LOCKED." "WARN"
+    Write-UILog "Existing $($script:EffectiveMode) session detected — system is currently LOCKED." "WARN"
 } else {
-    Write-UILog "System is NORMAL. Ready to activate lockdown."
+    if ($CONFIG.WhitelistDomain -eq "INSERT_DOMAIN_HERE" -or [string]::IsNullOrWhiteSpace($CONFIG.WhitelistDomain)) {
+        Write-UILog "No whitelist domain configured — click EDIT CONFIGURATION to set one." "WARN"
+    }
+    Write-UILog "System is NORMAL. Pick a mode and activate."
 }
 
 [System.Windows.Forms.Application]::Run($form)
